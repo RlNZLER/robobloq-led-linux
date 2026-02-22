@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robobloq-led"
+version = "0.1.0"
+description = "Control ROBOBLOQ USBHID ambient LED strips (1a86:fe07) on Linux."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Amel Varghese" }]
+
+[project.scripts]
+robobloq-led = "robobloq_led.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
