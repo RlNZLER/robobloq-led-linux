@@ -448,7 +448,6 @@ def set_color_api(c: Color):
     cancel_fade()
     cancel_effect()
 
-
     brightness = clamp(c.brightness or 100, 0, 100)
     r, g, b = apply_brightness(clamp(c.r,0,255), clamp(c.g,0,255), clamp(c.b,0,255), brightness)
 
