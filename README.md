@@ -151,6 +151,18 @@ lsusb | grep -i 1a86
 
 ---
 
+## Screen Sync (Ambilight-style)
+
+Supports:
+- External monitor capture (X11)
+- Real-time ambient color sync
+- Adjustable FPS and edge thickness
+
+Example:
+```
+python -m robobloq_led.screen_sync --monitor 2 --fps 40
+```
+
 ## Roadmap
 
 - [ ] Presets (movie / gaming / focus)
