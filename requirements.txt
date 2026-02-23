@@ -11,7 +11,7 @@ numpy==2.2.6
 pillow==12.1.1
 pydantic==2.12.5
 pydantic_core==2.41.5
--e git+https://github.com/RlNZLER/robobloq-led-linux.git@8ef356de15ec0f12bba5af461da096f961b67313#egg=robobloq_led
+-e git+https://github.com/RlNZLER/robobloq-led-linux.git@61ea284c731ac3c164f66b93fc5ce7640e6d6dd7#egg=robobloq_led
 starlette==0.52.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0

@@ -1,8 +1,10 @@
+import mss
+import time
+import asyncio
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-import asyncio
-
 from .device import RobobloqController, find_vendor_device
 
 app = FastAPI(title="Robobloq LED Controller")
@@ -14,6 +16,8 @@ _fade_task: asyncio.Task | None = None
 _lock = asyncio.Lock()
 _effect_task: asyncio.Task | None = None
 _effect_stop = asyncio.Event()
+_sync_task: asyncio.Task | None = None
+_sync_stop = asyncio.Event()
 
 def get_controller() -> RobobloqController:
     global _controller
@@ -44,6 +48,15 @@ class EffectRequest(BaseModel):
     b: int | None = None
     brightness: int | None = 100
 
+class SyncStartRequest(BaseModel):
+    monitor: int = 2
+    fps: int = 60
+    thickness: int = 80
+    downscale: int = 4          # sample every Nth pixel (1=no downscale)
+    alpha: float = 0.35         # smoothing
+    change_threshold: int = 6   # don't spam USB for tiny changes
+
+
 def clamp(v: int, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
 
@@ -65,6 +78,14 @@ def cancel_effect():
         _effect_task.cancel()
     _effect_task = None
     _effect_stop.clear()
+
+def cancel_sync():
+    global _sync_task
+    if _sync_task and not _sync_task.done():
+        _sync_stop.set()
+        _sync_task.cancel()
+    _sync_task = None
+    _sync_stop.clear()
 
 def wheel(pos: int) -> tuple[int, int, int]:
     # Classic rainbow wheel (0..255)
@@ -130,6 +151,7 @@ async def effect_rainbow(speed: int):
             _current["r"], _current["g"], _current["b"] = r, g, b
             j = (j + 1) % 256
             await asyncio.sleep(delay)
+
 async def fade_to(target: dict, duration_ms: int, steps: int):
     ctl = get_controller()
     duration_ms = clamp(duration_ms, 0, 60_000)
@@ -148,6 +170,77 @@ async def fade_to(target: dict, duration_ms: int, steps: int):
             _current["r"], _current["g"], _current["b"] = r, g, b
 
             await asyncio.sleep(duration_ms / steps / 1000.0)
+
+async def screen_sync_loop(cfg: SyncStartRequest):
+    ctl = get_controller()
+
+    fps = clamp(cfg.fps, 1, 120)
+    thickness = clamp(cfg.thickness, 1, 400)
+    down = clamp(cfg.downscale, 1, 16)
+    alpha = float(cfg.alpha)
+    if alpha < 0.0: alpha = 0.0
+    if alpha > 1.0: alpha = 1.0
+    change_thr = clamp(cfg.change_threshold, 0, 255*3)
+
+    dt = 1.0 / fps
+
+    # State for smoothing + change threshold
+    smooth = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    last_rgb = (-1, -1, -1)
+
+    def avg_edge_color(img: np.ndarray, thickness_px: int):
+        h, w, _ = img.shape
+        t = max(1, min(thickness_px, w // 4, h // 4))
+
+        left = img[:, :t, :]
+        top = img[:t, :, :]
+        right = img[:, w - t :, :]
+
+        l = left.mean(axis=(0, 1))
+        tcol = top.mean(axis=(0, 1))
+        r = right.mean(axis=(0, 1))
+        return l, tcol, r
+
+    def combine_edges(l, tcol, r):
+        # Weighted towards top (movie-friendly)
+        return 0.25*l + 0.50*tcol + 0.25*r
+
+    # IMPORTANT: mss is best created once per task
+    with mss.mss() as sct:
+        if cfg.monitor < 1 or cfg.monitor >= len(sct.monitors):
+            raise ValueError(f"Invalid monitor index {cfg.monitor}. Available: 1..{len(sct.monitors)-1}")
+
+        mon = sct.monitors[cfg.monitor]
+
+        # Keep sync exclusive with other LED writers
+        async with _lock:
+            while not _sync_stop.is_set():
+                start = time.time()
+
+                frame = np.array(sct.grab(mon))[:, :, :3][:, :, ::-1]  # RGB
+                img = frame[::down, ::down, :]  # downscale for speed
+
+                l, tcol, r = avg_edge_color(img, thickness_px=thickness)
+                target = combine_edges(l, tcol, r)
+
+                # smoothing
+                smooth = (1.0 - alpha) * smooth + alpha * target.astype(np.float32)
+                rgb = tuple(np.clip(smooth, 0, 255).astype(int))
+
+                # reduce USB spam
+                if sum(abs(a - b) for a, b in zip(rgb, last_rgb)) > change_thr:
+                    ctl.set_color(*rgb)
+                    _current["r"], _current["g"], _current["b"] = rgb
+                    last_rgb = rgb
+
+                elapsed = time.time() - start
+                sleep_for = dt - elapsed
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+                else:
+                    # if we’re slower than target FPS, yield control
+                    await asyncio.sleep(0)
+
 
 HTML_PAGE = r"""
 <!doctype html>
@@ -242,6 +335,7 @@ HTML_PAGE = r"""
       <div class="tabs">
         <div class="tab active" id="tab-colors" onclick="showTab('colors')">Colors</div>
         <div class="tab" id="tab-effects" onclick="showTab('effects')">Effects</div>
+        <div class="tab" id="tab-sync" onclick="showTab('sync')">Sync</div>
       </div>
 
       <!-- Colors tab -->
@@ -315,6 +409,63 @@ HTML_PAGE = r"""
         </div>
       </div>
 
+      <!-- Sync tab -->
+      <div id="panel-sync" class="hidden">
+        <div class="row">
+          <div class="label">Monitor</div>
+          <input id="syncMonitor" type="number" min="1" value="2" style="width:90px">
+          <div class="label">FPS</div>
+          <input id="syncFps" type="range" min="5" max="90" value="60" oninput="syncLabels()">
+          <div class="value" id="syncFpsVal">60</div>
+        </div>
+
+        <div style="height:12px"></div>
+
+        <div class="row">
+          <div class="label">Thickness</div>
+          <input id="syncThickness" type="range" min="10" max="250" value="80" oninput="syncLabels()">
+          <div class="value" id="syncThicknessVal">80px</div>
+        </div>
+
+        <div style="height:12px"></div>
+
+        <div class="row">
+          <div class="label">Downscale</div>
+          <input id="syncDown" type="range" min="1" max="10" value="4" oninput="syncLabels()">
+          <div class="value" id="syncDownVal">4x</div>
+        </div>
+
+        <div style="height:12px"></div>
+
+        <div class="row">
+          <div class="label">Smoothing</div>
+          <input id="syncAlpha" type="range" min="0" max="100" value="35" oninput="syncLabels()">
+          <div class="value" id="syncAlphaVal">0.35</div>
+        </div>
+
+        <div style="height:12px"></div>
+
+        <div class="row">
+          <div class="label">Change threshold</div>
+          <input id="syncThr" type="range" min="0" max="60" value="6" oninput="syncLabels()">
+          <div class="value" id="syncThrVal">6</div>
+        </div>
+
+        <div style="height:12px"></div>
+
+        <div class="row">
+          <button class="btn primary" onclick="startSync()">Start Sync</button>
+          <button class="btn" onclick="stopSync()">Stop Sync</button>
+          <button class="btn" onclick="stopAll()">Stop All</button>
+          <button class="btn danger" onclick="turnOff()">Off</button>
+        </div>
+
+        <div class="hint">
+          Use <code>Monitor</code> = the MSS index that matches your external display (you found it was 2).<br>
+          Downscale 4x is a good default. Lower downscale = better quality but more CPU.
+        </div>
+      </div>
+
       <div class="toast">
         <div><strong>Status:</strong> <span id="status">Ready.</span></div>
         <div><span id="mini">Brightness 100% • Fade 800ms • Speed 50</span></div>
@@ -326,6 +477,7 @@ HTML_PAGE = r"""
       </div>
     </div>
   </div>
+  
 
 <script>
 let selectedEffect = "pulse";
@@ -336,8 +488,11 @@ function setStatus(text){ document.getElementById("status").textContent = text; 
 function showTab(name){
   document.getElementById("panel-colors").classList.toggle("hidden", name !== "colors");
   document.getElementById("panel-effects").classList.toggle("hidden", name !== "effects");
+  document.getElementById("panel-sync").classList.toggle("hidden", name !== "sync");
+
   document.getElementById("tab-colors").classList.toggle("active", name === "colors");
   document.getElementById("tab-effects").classList.toggle("active", name === "effects");
+  document.getElementById("tab-sync").classList.toggle("active", name === "sync");
 }
 
 function hexToRgb(hex) {
@@ -364,6 +519,18 @@ function syncLabels(){
   document.getElementById("durVal").textContent = `${d}ms`;
   document.getElementById("speedVal").textContent = `${s}`;
   document.getElementById("mini").textContent = `Brightness ${b}% • Fade ${d}ms • Speed ${s}`;
+  
+  const sfps = parseInt(document.getElementById("syncFps").value, 10);
+  const sth = parseInt(document.getElementById("syncThickness").value, 10);
+  const sdown = parseInt(document.getElementById("syncDown").value, 10);
+  const salpha = parseInt(document.getElementById("syncAlpha").value, 10);
+  const sthr = parseInt(document.getElementById("syncThr").value, 10);
+
+  document.getElementById("syncFpsVal").textContent = `${sfps}`;
+  document.getElementById("syncThicknessVal").textContent = `${sth}px`;
+  document.getElementById("syncDownVal").textContent = `${sdown}x`;
+  document.getElementById("syncAlphaVal").textContent = `${(salpha/100).toFixed(2)}`;
+  document.getElementById("syncThrVal").textContent = `${sthr}`;
 }
 
 async function applyInstant() {
@@ -397,6 +564,25 @@ async function stopAll(){
   await postJson("/api/stop", {});
   await postJson("/api/effect/stop", {});
   setStatus("Stopped.");
+}
+
+async function startSync(){
+  const monitor = parseInt(document.getElementById("syncMonitor").value, 10);
+  const fps = parseInt(document.getElementById("syncFps").value, 10);
+  const thickness = parseInt(document.getElementById("syncThickness").value, 10);
+  const downscale = parseInt(document.getElementById("syncDown").value, 10);
+  const alpha = parseInt(document.getElementById("syncAlpha").value, 10) / 100.0;
+  const change_threshold = parseInt(document.getElementById("syncThr").value, 10);
+
+  const payload = { monitor, fps, thickness, downscale, alpha, change_threshold };
+
+  const {ok, data} = await postJson("/api/sync/start", payload);
+  setStatus(ok ? `Sync running (Monitor #${monitor} • ${fps} FPS)` : `Error: ${data.detail || "unknown"}`);
+}
+
+async function stopSync(){
+  const {ok, data} = await postJson("/api/sync/stop", {});
+  setStatus(ok ? "Sync stopped." : `Error: ${data.detail || "unknown"}`);
 }
 
 function preset(hex, name){
@@ -446,6 +632,7 @@ def index():
 def set_color_api(c: Color):
     ctl = get_controller()
     cancel_fade()
+    cancel_sync()
     cancel_effect()
 
     brightness = clamp(c.brightness or 100, 0, 100)
@@ -458,6 +645,7 @@ def set_color_api(c: Color):
 @app.post("/api/fade")
 async def fade_api(req: FadeRequest):
     cancel_fade()
+    cancel_sync()
     cancel_effect()
 
     brightness = clamp(req.brightness or 100, 0, 100)
@@ -471,6 +659,7 @@ async def fade_api(req: FadeRequest):
 @app.post("/api/effect/start")
 async def effect_start(req: EffectRequest):
     cancel_fade()
+    cancel_sync()
     cancel_effect()
 
     eff = (req.effect or "").lower().strip()
@@ -493,8 +682,44 @@ async def effect_start(req: EffectRequest):
 
     raise HTTPException(status_code=400, detail="Unknown effect. Use 'pulse' or 'rainbow'.")
 
+@app.post("/api/sync/start")
+async def sync_start(req: SyncStartRequest):
+    # Stop other modes
+    cancel_fade()
+    cancel_effect()
+    cancel_sync()
+
+    global _sync_task
+    try:
+        _sync_task = asyncio.create_task(screen_sync_loop(req))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return JSONResponse({
+        "ok": True,
+        "mode": "sync",
+        "config": req.model_dump(),
+    })
+
+@app.post("/api/sync/stop")
+def sync_stop():
+    cancel_sync()
+    return JSONResponse({"ok": True, "mode": "manual"})
+
+@app.get("/api/status")
+def status():
+    mode = "manual"
+    if _sync_task and not _sync_task.done():
+        mode = "sync"
+    elif _effect_task and not _effect_task.done():
+        mode = "effect"
+    elif _fade_task and not _fade_task.done():
+        mode = "fade"
+    return JSONResponse({"ok": True, "mode": mode, "current": _current})
+
 @app.post("/api/effect/stop")
 def effect_stop():
+    cancel_sync()
     cancel_effect()
     return JSONResponse({"ok": True})
 
@@ -502,6 +727,7 @@ def effect_stop():
 def off_api():
     ctl = get_controller()
     cancel_fade()
+    cancel_sync()
     cancel_effect()
     ctl.set_color(0, 0, 0)
     _current["r"], _current["g"], _current["b"] = 0, 0, 0
@@ -510,5 +736,6 @@ def off_api():
 @app.post("/api/stop")
 def stop_api():
     cancel_fade()
+    cancel_sync()
     cancel_effect()
     return JSONResponse({"ok": True})
