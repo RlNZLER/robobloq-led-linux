@@ -99,6 +99,17 @@ HTML_PAGE = """
   <h2>Robobloq LED Controller</h2>
 
   <div class="card">
+    <div class="row" style="margin-top:12px;">
+      <label>Presets</label>
+      <button onclick="preset('#ffc878')">Warm</button>
+      <button onclick="preset('#d8ecff')">Cool</button>
+      <button onclick="preset('#ffffff')">White</button>
+      <button onclick="preset('#ff0000')">Red</button>
+      <button onclick="preset('#00ff00')">Green</button>
+      <button onclick="preset('#0000ff')">Blue</button>
+      <button onclick="preset('#b400ff')">Purple</button>
+      <button onclick="preset('#000000')">Off</button>
+    </div>
     <div class="row">
       <label>Color</label>
       <input id="picker" type="color" value="#ffc878" oninput="updatePreview()" />
@@ -170,6 +181,15 @@ function updatePreview() {
   const rgb = applyBrightness(hexToRgb(hex), b);
   const previewHex = "#" + [rgb.r,rgb.g,rgb.b].map(x => x.toString(16).padStart(2,"0")).join("");
   document.getElementById("preview").style.background = previewHex;
+}
+
+function preset(hex) {
+  document.getElementById("picker").value = hex;
+  updatePreview();
+  // Use fade if duration > 0, else instant
+  const d = parseInt(document.getElementById("duration").value, 10);
+  if (hex === "#000000") return turnOff();
+  return (d === 0) ? applyInstant() : applyFade();
 }
 
 async function applyInstant() {
